@@ -1,0 +1,6 @@
+/target/
+*.token
+*.ics
+.env
+.env.*
+/config.json

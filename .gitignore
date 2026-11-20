@@ -4,3 +4,6 @@
 .env
 .env.*
 /config.json
+/academic.json
+/academic.csv
+/downloads/

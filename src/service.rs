@@ -1,4 +1,4 @@
-use crate::client::{Client, Endpoint, Error, Result, WEB, err};
+use crate::client::{Client, Endpoint, Result, WEB, err};
 use chrono::{DateTime, Days, FixedOffset, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ const MAX_PAGES: usize = 20;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Homework,
+    Courseware,
     Material,
     Test,
     Notice,
@@ -20,6 +21,7 @@ impl Kind {
     fn filter(self) -> Value {
         match self {
             Self::Homework => json!(4),
+            Self::Courseware => json!(1),
             Self::Material => json!(["2", "8"]),
             Self::Test => json!(6),
             Self::Notice => json!(7),
@@ -29,6 +31,7 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Self::Homework => "作业",
+            Self::Courseware => "互动课件",
             Self::Material => "资料",
             Self::Test => "测试",
             Self::Notice => "公告",
@@ -56,6 +59,21 @@ pub struct Course {
     pub class_name: Option<String>,
     pub teacher: Option<String>,
     pub url: String,
+}
+
+#[derive(Serialize)]
+pub struct TermCourse {
+    #[serde(flatten)]
+    pub semester: Semester,
+    #[serde(flatten)]
+    pub course: Course,
+}
+
+#[derive(Serialize)]
+pub struct CourseCatalog {
+    pub items: Vec<TermCourse>,
+    pub errors: Vec<String>,
+    pub limited: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +116,10 @@ pub struct Item {
     pub grade: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_grade: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_count: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
 }
@@ -149,7 +171,7 @@ pub fn integer(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
-fn text(v: &Value) -> Option<String> {
+pub(crate) fn text(v: &Value) -> Option<String> {
     match v {
         Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
@@ -157,15 +179,15 @@ fn text(v: &Value) -> Option<String> {
     }
 }
 
-fn first(v: &Value, fields: &[&str]) -> Option<String> {
+pub(crate) fn first(v: &Value, fields: &[&str]) -> Option<String> {
     fields.iter().find_map(|&f| text(&v[f]))
 }
 
-fn id(v: &Value, fields: &[&str]) -> Result<String> {
+pub(crate) fn id(v: &Value, fields: &[&str]) -> Result<String> {
     first(v, fields).ok_or_else(|| err("课堂派响应中缺少项目编号，接口字段可能已变化。"))
 }
 
-fn rows<'a>(v: &'a Value, label: &str) -> Result<&'a [Value]> {
+pub(crate) fn rows<'a>(v: &'a Value, label: &str) -> Result<&'a [Value]> {
     v.as_array()
         .filter(|a| a.iter().all(Value::is_object))
         .map(Vec::as_slice)
@@ -176,7 +198,7 @@ pub fn shanghai() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("valid offset")
 }
 
-fn time(v: &Value) -> Option<DateTime<FixedOffset>> {
+pub(crate) fn time(v: &Value) -> Option<DateTime<FixedOffset>> {
     let tz = shanghai();
     if let Some(n) = integer(v) {
         if n <= 0 {
@@ -228,7 +250,7 @@ fn attachments(v: &Value) -> Vec<Attachment> {
         .collect()
 }
 
-fn folder(raw: &Value) -> bool {
+pub(crate) fn folder(raw: &Value) -> bool {
     integer(&raw["item_type"]) == Some(2)
 }
 
@@ -254,7 +276,7 @@ fn test_status(code: Option<i64>) -> &'static str {
     }
 }
 
-fn choose<'a>(items: &'a [Course], selector: &str) -> Result<&'a Course> {
+pub(crate) fn choose<'a>(items: &'a [Course], selector: &str) -> Result<&'a Course> {
     let selector = selector.trim();
     if selector.is_empty() {
         return Err(err("请输入课程名或课程 ID。"));
@@ -294,16 +316,48 @@ fn choose<'a>(items: &'a [Course], selector: &str) -> Result<&'a Course> {
 
 pub struct Service(pub Client);
 
+pub fn normalize_profile(p: &Value) -> Result<Value> {
+    if !p.is_object() {
+        return Err(err("课堂派个人资料响应格式不符。"));
+    }
+    Ok(
+        json!({"id": first(p, &["uid", "userid", "id"]), "name": first(p, &["realname", "username", "name"]),
+              "school": first(p, &["schoolname", "schoolName", "school"])}),
+    )
+}
+
 impl Service {
+    pub async fn all_courses(&mut self) -> Result<CourseCatalog> {
+        let terms = self.semesters().await?;
+        let mut out = CourseCatalog {
+            items: vec![],
+            errors: vec![],
+            limited: terms.len() > 40,
+        };
+        for s in terms.into_iter().take(40) {
+            let scope = Scope {
+                semester: Some(s.semester.clone()),
+                term: Some(s.term.clone()),
+            };
+            match self.courses(&scope).await {
+                Ok(list) => out
+                    .items
+                    .extend(list.items.into_iter().map(|course| TermCourse {
+                        semester: s.clone(),
+                        course,
+                    })),
+                Err(e) if e.is_auth() => return Err(e),
+                Err(e) => out
+                    .errors
+                    .push(format!("{} / {}：{}", s.semester, s.term, e)),
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn profile(&mut self) -> Result<Value> {
         let p = self.0.query(Endpoint::Profile, json!({})).await?;
-        if !p.is_object() {
-            return Err(err("课堂派个人资料响应格式不符。"));
-        }
-        Ok(
-            json!({"id": first(&p, &["uid", "userid", "id"]), "name": first(&p, &["realname", "username", "name"]),
-                  "school": first(&p, &["schoolname", "schoolName", "school"])}),
-        )
+        normalize_profile(&p)
     }
 
     pub async fn semesters(&mut self) -> Result<Vec<Semester>> {
@@ -375,7 +429,7 @@ impl Service {
         })
     }
 
-    async fn content(
+    pub(crate) async fn content(
         &mut self,
         course: &Course,
         kind: Kind,
@@ -473,7 +527,7 @@ impl Service {
                                 .any(|a| a.name.to_lowercase().contains(kw))
                     })
                 })),
-                Err(e) if one_course || matches!(e, Error::Auth(_)) => return Err(e),
+                Err(e) if one_course || e.is_auth() => return Err(e),
                 Err(e) => out.errors.push(Issue {
                     course_id: course.id.clone(),
                     course_title: course.title.clone(),
@@ -520,6 +574,10 @@ impl Service {
             entry.due_at = Some(t);
         }
         entry.max_grade = first(&data, &["fullscore", "total_score", "totalScore"]);
+        entry.question_count = ["question_count", "subject_count", "subjectTotal"]
+            .into_iter()
+            .find_map(|k| integer(&data[k]).filter(|n| *n >= 0))
+            .or(entry.question_count);
         entry.attachments = attachments(&data);
         Ok(entry)
     }
@@ -538,7 +596,7 @@ impl Service {
     }
 }
 
-fn normalize(raw: &Value, kind: Kind, c: &Course) -> Result<Item> {
+pub(crate) fn normalize(raw: &Value, kind: Kind, c: &Course) -> Result<Item> {
     let is_folder = folder(raw);
     let key = if kind == Kind::Homework {
         &["homeworkid", "id"][..]
@@ -561,6 +619,8 @@ fn normalize(raw: &Value, kind: Kind, c: &Course) -> Result<Item> {
         published_at: None,
         grade: None,
         max_grade: None,
+        duration_seconds: None,
+        question_count: None,
         attachments: vec![],
     };
     if is_folder {
@@ -592,6 +652,16 @@ fn normalize(raw: &Value, kind: Kind, c: &Course) -> Result<Item> {
             i.status = Some(test_status(i.status_code));
             i.opens_at = first_time(raw, &["begintime", "releasetime"]);
             i.due_at = time(&raw["endtime"]);
+            i.duration_seconds = integer(&raw["timelength"]).filter(|n| *n > 0);
+            i.question_count = integer(&raw["subjectTotal"]).filter(|n| *n >= 0);
+            // Mirror the student card's publication rules, including unpublished grades.
+            if matches!(
+                (integer(&raw["over"]), i.status_code),
+                (Some(0), Some(6 | 7)) | (Some(1), Some(8 | 10))
+            ) {
+                i.grade = text(&raw["score"]);
+                i.max_grade = text(&raw["total_score"]);
+            }
         }
         Kind::Notice => {
             i.published_at = time(&raw["releasetime"]);
@@ -605,7 +675,7 @@ fn normalize(raw: &Value, kind: Kind, c: &Course) -> Result<Item> {
                 &[common[0], common[1], ("id", &i.id), ("type", ty)],
             );
         }
-        Kind::Chapter => {}
+        Kind::Chapter | Kind::Courseware => {}
     }
     Ok(i)
 }

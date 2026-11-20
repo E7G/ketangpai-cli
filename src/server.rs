@@ -1,4 +1,5 @@
-use crate::client::{Client, Result as QueryResult, err, read_token};
+use crate::auth::{self, CredentialsInput, Secret};
+use crate::client::{Client, Result as QueryResult, err};
 use crate::service::{Kind, Scope, Service};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerConfig};
@@ -39,6 +40,8 @@ struct SemesterArgs {
     semester: Option<String>,
     /// 学期编号；与 semester 同时传入。
     term: Option<String>,
+    /// 扫描全部可选学期，不能和 semester 或 term 同传。
+    all: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -59,6 +62,136 @@ struct HomeworkArgs {
     course: String,
     /// 作业 ID 或 list_homework 的从 1 开始的序号。
     homework: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InboxArgs {
+    /// 仅返回未读；默认返回全部。
+    unread: Option<bool>,
+    /// 匹配通知标题或课程名。
+    keyword: Option<String>,
+    /// 最多返回 1–200 条，默认 20。
+    limit: Option<usize>,
+    /// 返回较长正文，不传时正文最多 160 字。
+    full: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProgressArgs {
+    semester: Option<String>,
+    term: Option<String>,
+    course: String,
+    directory: Option<String>,
+    /// 子目录最大深度（0–8）。
+    depth: Option<u8>,
+    /// 隐藏已完成项目，但保留汇总计数。
+    todo: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AcademicArgs {
+    /// 起始日期（YYYY-MM-DD），含当日。
+    from: Option<String>,
+    /// 结束日期（YYYY-MM-DD），含当日。
+    to: Option<String>,
+    keyword: Option<String>,
+    /// 教学周次，与日期范围互斥；需在教务文件设置 semester_start。
+    week: Option<u16>,
+}
+
+impl AcademicArgs {
+    fn filter(self) -> QueryResult<crate::academic::Filter> {
+        Ok(crate::academic::Filter {
+            from: self
+                .from
+                .as_deref()
+                .map(crate::academic::parse_date)
+                .transpose()?,
+            to: self
+                .to
+                .as_deref()
+                .map(crate::academic::parse_date)
+                .transpose()?,
+            keyword: self.keyword,
+            week: self.week,
+        })
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FindArgs {
+    semester: Option<String>,
+    term: Option<String>,
+    course: String,
+    keyword: String,
+    directory: Option<String>,
+    max_depth: Option<u8>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct OverviewArgs {
+    semester: Option<String>,
+    term: Option<String>,
+    depth: Option<u8>,
+    max_courses: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PanArgs {
+    folder_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DownloadArgs {
+    semester: Option<String>,
+    term: Option<String>,
+    course: String,
+    /// 资料 ID，请先用 list_materials 或 find_materials 查询。
+    data_id: String,
+    directory: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExportArgs {
+    /// 已配置输出目录内的文件名，不得含路径；默认 schedule.ics。
+    filename: Option<String>,
+    week: Option<u16>,
+}
+
+fn output_root() -> QueryResult<std::path::PathBuf> {
+    let raw = std::env::var_os("KETANGPAI_MCP_OUTPUT_DIR").filter(|p| !p.is_empty())
+        .ok_or_else(|| err("MCP 文件保存未启用。请在 MCP 启动环境中配置 KETANGPAI_MCP_OUTPUT_DIR，或直接用 CLI。"))?;
+    let path = std::fs::canonicalize(raw).map_err(|_| err("MCP 输出目录不存在。"))?;
+    if !path.is_dir() {
+        return Err(err("MCP 输出路径必须是已存在的目录。"));
+    }
+    Ok(path)
+}
+
+fn calendar_name(name: Option<&str>) -> QueryResult<&str> {
+    let name = name.unwrap_or("schedule.ics");
+    if !name.to_ascii_lowercase().ends_with(".ics") || crate::download::filename(name) != name {
+        return Err(err("请使用不带路径的 .ics 文件名。"));
+    }
+    Ok(name)
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LoginArgs {
+    /// 手机号或邮箱；留空则使用本机环境变量或 config.json。
+    phone: Option<String>,
+    /// 只在显式传 phone 时使用。优先使用本机配置，不要在对话中粘贴密码。
+    #[schemars(with = "Option<String>")]
+    password: Option<Secret>,
 }
 
 #[derive(Clone)]
@@ -85,7 +218,7 @@ impl Server {
         let client = if self.demo {
             Client::Demo
         } else {
-            Client::live(&read_token()?)?
+            Client::configured().await?
         };
         Ok((guard, Service(client)))
     }
@@ -105,10 +238,260 @@ impl Server {
             Err(e) => reply::<()>(Err(e)),
         }
     }
+
+    fn academic(&self, kind: crate::academic::Kind, a: AcademicArgs) -> CallToolResult {
+        let result = (|| {
+            let f = a.filter()?;
+            // Do not accept arbitrary filesystem paths from tool callers.
+            crate::academic::load(None, self.demo, kind, &f)
+        })();
+        reply(result)
+    }
 }
 
 #[tool_router]
 impl Server {
+    #[tool(
+        description = "按标题或附件名递归查找课程资料，返回目录和网页入口。",
+        annotations(read_only_hint = true)
+    )]
+    async fn find_materials(&self, Parameters(a): Parameters<FindArgs>) -> CallToolResult {
+        match self.session().await {
+            Ok((_g, mut api)) => reply(
+                crate::student::find_materials(
+                    &mut api,
+                    &Scope {
+                        semester: a.semester,
+                        term: a.term,
+                    },
+                    &a.course,
+                    a.directory.as_deref().unwrap_or("0"),
+                    a.max_depth.unwrap_or(3),
+                    &a.keyword,
+                )
+                .await,
+            ),
+            Err(e) => reply::<()>(Err(e)),
+        }
+    }
+
+    #[tool(
+        description = "查看本学期各课程学习活动完成情况；未完成多的排前，错误单列。",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_progress_overview(
+        &self,
+        Parameters(a): Parameters<OverviewArgs>,
+    ) -> CallToolResult {
+        match self.session().await {
+            Ok((_g, mut api)) => reply(
+                crate::student::progress_overview(
+                    &mut api,
+                    &Scope {
+                        semester: a.semester,
+                        term: a.term,
+                    },
+                    a.depth.unwrap_or(3),
+                    a.max_courses.unwrap_or(20),
+                )
+                .await,
+            ),
+            Err(e) => reply::<()>(Err(e)),
+        }
+    }
+
+    #[tool(
+        description = "列出本机预先配置的云盘同步目录；不是课堂派在线云盘，只返回文件和文件夹元数据。",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_pan_files(&self, Parameters(a): Parameters<PanArgs>) -> CallToolResult {
+        reply(crate::pan::list(None, a.folder_id.as_deref(), self.demo))
+    }
+
+    #[tool(
+        description = "下载某个资料 ID 的已授权附件，仅写入预先配置的 MCP 输出目录，不覆盖文件。",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn download_material(&self, Parameters(a): Parameters<DownloadArgs>) -> CallToolResult {
+        let result = async {
+            if self.demo {
+                return Err(err("演示模式不会下载文件，请调用 plan_material_download。"));
+            }
+            if a.data_id.trim().is_empty() {
+                return Err(err("必须提供资料 ID。"));
+            }
+            let root = output_root()?;
+            let (_g, mut api) = self.session().await?;
+            let report = crate::download::batch(
+                &mut api,
+                &Scope {
+                    semester: a.semester,
+                    term: a.term,
+                },
+                crate::download::Options {
+                    course: &a.course,
+                    directory: a.directory.as_deref().unwrap_or("0"),
+                    depth: 3,
+                    keyword: None,
+                    material: Some(&a.data_id),
+                    max_files: 20,
+                    output: &root,
+                    dry_run: false,
+                },
+            )
+            .await?;
+            if report.items.is_empty() {
+                return Err(err("未找到资料 ID，或扫描范围内没有匹配项。"));
+            }
+            Ok(report)
+        }
+        .await;
+        reply(result)
+    }
+
+    #[tool(
+        description = "将本地教务课表导出到预先配置的 MCP 输出目录，不覆盖已有文件。",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn export_schedule_ics(&self, Parameters(a): Parameters<ExportArgs>) -> CallToolResult {
+        let result = (|| {
+            if self.demo {
+                return Err(err("演示模式不会通过 MCP 写文件。"));
+            }
+            let path = output_root()?.join(calendar_name(a.filename.as_deref())?);
+            let agenda = crate::academic::load(
+                None,
+                false,
+                crate::academic::Kind::Class,
+                &crate::academic::Filter {
+                    week: a.week,
+                    ..Default::default()
+                },
+            )?;
+            if agenda.items.is_empty() {
+                return Err(err("没有可导出的课程安排。"));
+            }
+            crate::export_file(&path, &crate::academic::export(&agenda))?;
+            Ok(serde_json::json!({"filename":path.file_name(),"count":agenda.items.len()}))
+        })();
+        reply(result)
+    }
+
+    #[tool(
+        description = "查询课堂派通知中心标题、来源和未读状态，不会标为已读。",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_notifications(&self, Parameters(a): Parameters<InboxArgs>) -> CallToolResult {
+        match self.session().await {
+            Ok((_g, mut api)) => reply(
+                crate::student::notifications(
+                    &mut api,
+                    a.unread.unwrap_or(false),
+                    a.keyword.as_deref(),
+                    a.limit.unwrap_or(20),
+                    a.full.unwrap_or(false),
+                )
+                .await,
+            ),
+            Err(e) => reply::<()>(Err(e)),
+        }
+    }
+
+    #[tool(
+        description = "汇总一门课的章节学习活动及完成状态，不会开始学习或改进度。",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_chapter_progress(
+        &self,
+        Parameters(a): Parameters<ProgressArgs>,
+    ) -> CallToolResult {
+        match self.session().await {
+            Ok((_g, mut api)) => reply(
+                crate::student::progress(
+                    &mut api,
+                    &Scope {
+                        semester: a.semester,
+                        term: a.term,
+                    },
+                    &a.course,
+                    a.directory.as_deref().unwrap_or("0"),
+                    a.depth.unwrap_or(3),
+                    a.todo.unwrap_or(false),
+                )
+                .await,
+            ),
+            Err(e) => reply::<()>(Err(e)),
+        }
+    }
+
+    #[tool(
+        description = "预览课程中明确允许下载的附件。不返回签名链接，不下载文件。",
+        annotations(read_only_hint = true)
+    )]
+    async fn plan_material_download(&self, Parameters(a): Parameters<Query>) -> CallToolResult {
+        let Some(course) = a.course.as_deref() else {
+            return reply::<()>(Err(err("请指定一门课程。")));
+        };
+        match self.session().await {
+            Ok((_g, mut api)) => reply(
+                crate::download::batch(
+                    &mut api,
+                    &a.scope(),
+                    crate::download::Options {
+                        course,
+                        directory: a.directory.as_deref().unwrap_or("0"),
+                        depth: 2,
+                        keyword: a.keyword.as_deref(),
+                        material: None,
+                        max_files: 20,
+                        output: std::path::Path::new("."),
+                        dry_run: true,
+                    },
+                )
+                .await,
+            ),
+            Err(e) => reply::<()>(Err(e)),
+        }
+    }
+
+    #[tool(
+        description = "查询已导入本机的教务课表，不是课堂派实时课表。",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_schedule(&self, Parameters(a): Parameters<AcademicArgs>) -> CallToolResult {
+        self.academic(crate::academic::Kind::Class, a)
+    }
+
+    #[tool(
+        description = "查询已导入本机的学校考试安排，不是课堂派课程测验，也不会连接学校系统。",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_school_exams(&self, Parameters(a): Parameters<AcademicArgs>) -> CallToolResult {
+        self.academic(crate::academic::Kind::Exam, a)
+    }
+
+    #[tool(
+        description = "使用课堂派账号密码登录并保存本机会话。不传参数时使用环境变量或 config.json。",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    async fn login(&self, Parameters(a): Parameters<LoginArgs>) -> CallToolResult {
+        if self.demo {
+            return reply::<()>(Err(err("离线演示不需要登录，也不会接收真实凭据。")));
+        }
+        let _guard = self.gate.lock().await;
+        let result = async {
+            let creds = auth::resolve(CredentialsInput {
+                phone: a.phone,
+                password: a.password,
+            })?
+            .ok_or_else(auth::missing_credentials)?;
+            let (_, profile) = auth::login(creds, true).await?;
+            Ok(serde_json::json!({"verified":true,"saved":true,"profile":profile}))
+        }
+        .await;
+        reply(result)
+    }
+
     #[tool(
         description = "读取当前课堂派学生账号的基础资料，不读取联系方式。",
         annotations(read_only_hint = true)
@@ -136,6 +519,15 @@ impl Server {
         annotations(read_only_hint = true)
     )]
     async fn list_courses(&self, Parameters(a): Parameters<SemesterArgs>) -> CallToolResult {
+        if a.all == Some(true) {
+            if a.semester.is_some() || a.term.is_some() {
+                return reply::<()>(Err(err("all 不能和 semester 或 term 同传。")));
+            }
+            return match self.session().await {
+                Ok((_g, mut api)) => reply(api.all_courses().await),
+                Err(e) => reply::<()>(Err(e)),
+            };
+        }
         match self.session().await {
             Ok((_guard, mut api)) => reply(
                 api.courses(&Scope {
@@ -262,4 +654,23 @@ pub async fn run(demo: bool) -> QueryResult<()> {
         .await
         .map_err(|_| err("MCP stdio 服务意外退出。"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn restricted_calendar_output_name() {
+        assert_eq!(calendar_name(Some("我的课表.ics")).unwrap(), "我的课表.ics");
+        for bad in [
+            "../file.ics",
+            "dir/file.ics",
+            "foo\\file.ics",
+            "C:file.ics",
+            "NUL.ics",
+            "schedule.txt",
+        ] {
+            assert!(calendar_name(Some(bad)).is_err(), "{bad}");
+        }
+    }
 }

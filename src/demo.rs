@@ -11,6 +11,14 @@ pub fn answer(endpoint: Endpoint, payload: &Value) -> Value {
     let course = payload["courseid"].as_str().unwrap_or("");
     let dir = payload["dirid"].as_str().unwrap_or("0");
     let data = match endpoint {
+        Endpoint::Notifications => json!({"total":2,"list":[
+            {"id":"inbox-1","title":"期中复习安排","type":"0","coursename":"数字电路","isread":"0","createtime":hours(-2),"content":"<p>范围：<strong>组合逻辑</strong> &amp; 时序电路</p>"},
+            {"id":"inbox-2","title":"考试地点更新","type":1,"isread":1,"createtime":hours(-50),"coid":"demo-school"}
+        ]}),
+        Endpoint::NotificationBody => json!({"content":"<p>请核对示例考务地点。</p>"}),
+        Endpoint::MaterialDetail => json!({"candownload":"1","attachment":[
+            {"name":"逻辑门实验报告模板.pdf","url":"https://downloadv5.ketangpai.com/example"}
+        ]}),
         Endpoint::Profile => {
             json!({"uid":"demo-student", "username":"演示学生", "schoolname":"示例大学"})
         }
@@ -59,8 +67,10 @@ pub fn answer(endpoint: Endpoint, payload: &Value) -> Value {
             } else if course == "demo-digital" && (ty == 0 || ty == &json!(["2", "8"])) {
                 match dir {
                     "0" => json!([{"id":"dir-1", "name":"第一章：逻辑基础", "item_type":"2"}]),
-                    "dir-1" => json!([{"id":"mat-1", "title":"实验资料", "contenttype":"2",
-                                       "attachment":[{"name":"逻辑门实验报告模板.pdf", "size":"512 KB"}]}]),
+                    "dir-1" => {
+                        json!([{"id":"mat-1", "title":"实验资料", "contenttype":"2", "state":0,"candownload":1,
+                                       "attachment":[{"name":"逻辑门实验报告模板.pdf", "size":"512 KB"}]}])
+                    }
                     _ => json!([]),
                 }
             } else {

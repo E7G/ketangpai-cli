@@ -1,12 +1,17 @@
+mod academic;
+mod auth;
 mod calendar;
 mod client;
 mod demo;
+mod download;
+mod pan;
 mod server;
 mod service;
+mod student;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Days, FixedOffset, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
-use client::{Client, Error, Result, err, read_token, save_token};
+use client::{Client, Result, err, save_token, verify_token};
 use serde::Serialize;
 use service::{Board, Issue, Item, Kind, Listing, Scope, Service};
 use std::{
@@ -36,18 +41,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 录入并验证网页 Token；默认只验证。
+    /// 用课堂派账号密码登录并保存会话。
     Login {
-        /// 验证通过后保存到本机。
+        /// 改为手动导入网页 Token。
         #[arg(long)]
-        save: bool,
+        token: bool,
+        /// 只验证，不保存 Token。
+        #[arg(long)]
+        no_save: bool,
+        #[arg(long = "save", hide = true, conflicts_with = "no_save")]
+        legacy_save: bool,
     },
     /// 查询当前账号基础资料。
     Whoami,
+    /// 查看本机登录配置；不联网、不显示凭据。
+    Status {
+        /// 额外查询课堂派，验证登录是否可用。
+        #[arg(long)]
+        probe: bool,
+    },
     /// 查看可选学年学期。
     Semesters,
     /// 查看课程列表。
-    Courses,
+    Courses {
+        /// 列出全部可选学期的课程。
+        #[arg(long, conflicts_with_all = ["semester", "term"])]
+        all: bool,
+    },
     /// 待交作业截止看板。
     Hw {
         #[arg(long)]
@@ -78,12 +98,23 @@ enum Command {
         directory: String,
         #[arg(long, short)]
         keyword: Option<String>,
+        /// 递归搜索资料名称或附件名。
+        #[arg(long, conflicts_with = "keyword")]
+        find: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        depth: u8,
     },
     /// 列出课程章节或指定目录下的内容。
     Chapters {
         course: String,
         #[arg(long, default_value = "0")]
         directory: String,
+        #[arg(long)]
+        tree: bool,
+        #[arg(long)]
+        todo: bool,
+        #[arg(long, default_value_t = 3)]
+        depth: u8,
     },
     /// 导出未交作业的截止时间和提前 1 小时提醒。
     Ics {
@@ -100,9 +131,316 @@ enum Command {
         course: Option<String>,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u16).range(5..=1440))]
         interval: u16,
+        /// 运行一轮后退出，可搭配 --json 使用。
+        #[arg(long)]
+        once: bool,
+        /// 同时查询通知、作业状态、课程资料和测验动态。
+        #[arg(long)]
+        all_events: bool,
+    },
+    /// 查看课堂派通知中心（不会标记已读）。
+    Notifications {
+        #[arg(long)]
+        unread: bool,
+        #[arg(long, short)]
+        keyword: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// 展开通知正文（纯文本）。
+        #[arg(long)]
+        full: bool,
+    },
+    /// 查看课程章节中的学习活动完成情况。
+    Progress {
+        course: Option<String>,
+        #[arg(long, default_value = "0")]
+        directory: String,
+        #[arg(long, default_value_t = 3)]
+        depth: u8,
+        #[arg(long)]
+        todo: bool,
+        #[arg(long, default_value_t = 20)]
+        max_courses: usize,
+    },
+    /// 批量下载课堂派明确允许下载的课程附件。
+    Download {
+        course: String,
+        #[arg(long, default_value = "0")]
+        directory: String,
+        #[arg(long, default_value_t = 2)]
+        depth: u8,
+        #[arg(short, long, visible_alias = "find")]
+        keyword: Option<String>,
+        #[arg(long, visible_alias = "id")]
+        material: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        max_files: usize,
+        #[arg(long, default_value = "downloads")]
+        dir: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 查看从本地教务数据导入的课表。
+    Schedule(AcademicArgs),
+    /// 查看今天的本地教务课表。
+    Today {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// 查看未来 14 天的下一节课。
+    Next {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// 查看当前自然周或指定教学周的本地教务课表。
+    Week {
+        week: Option<u16>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        grid: bool,
+    },
+    /// 导出本地教务课表（默认全学期）。
+    ScheduleIcs(AcademicArgs),
+    /// 查看从本地教务数据导入的学校考试安排。
+    SchoolExams(AcademicArgs),
+    /// 列出指定本地云盘同步目录的文件（不连接课堂派云盘）。
+    Pan {
+        folder: Option<String>,
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
     /// 启动 MCP stdio 服务。
     Mcp,
+}
+
+#[derive(clap::Args)]
+struct AcademicArgs {
+    #[arg(long)]
+    file: Option<PathBuf>,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    to: Option<String>,
+    #[arg(short, long)]
+    keyword: Option<String>,
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    week: Option<u16>,
+    /// 将筛选后的安排导出为 iCalendar。
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+fn academic_command(
+    kind: academic::Kind,
+    args: &AcademicArgs,
+    demo: bool,
+    json: bool,
+) -> Result<u8> {
+    let filter = academic::Filter {
+        from: args.from.as_deref().map(academic::parse_date).transpose()?,
+        to: args.to.as_deref().map(academic::parse_date).transpose()?,
+        keyword: args.keyword.clone(),
+        week: args.week,
+    };
+    let data = academic::load(args.file.as_deref(), demo, kind, &filter)?;
+    if let Some(path) = &args.output {
+        if data.items.is_empty() {
+            return Err(err("没有可以导出的教务安排。"));
+        }
+        export_file(path, &academic::export(&data))?;
+    }
+    if json {
+        dump(&data)?;
+    } else {
+        print_agenda(&data, false, false);
+        if let Some(path) = &args.output {
+            println!("日历已导出：{}", terminal(&path.to_string_lossy()));
+        }
+    }
+    Ok(0)
+}
+
+fn print_agenda(data: &academic::Agenda, show_today: bool, countdown: bool) {
+    let now = Utc::now();
+    println!(
+        "数据来源：{}（本地导入 · 北京时间）",
+        terminal(&data.source)
+    );
+    if data.items.is_empty() {
+        println!("没有匹配的教务安排。");
+    }
+    for i in &data.items {
+        let label = if show_today {
+            Some(if now < i.start {
+                "未开始"
+            } else if now >= i.end {
+                "已结束"
+            } else {
+                "进行中"
+            })
+        } else {
+            i.status.as_deref()
+        };
+        println!(
+            "  {} → {} · {}{}{}{}{}",
+            date(Some(i.start)),
+            date(Some(i.end)),
+            terminal(&i.title),
+            i.location
+                .as_deref()
+                .map(|loc| format!(" · {}", terminal(loc)))
+                .unwrap_or_default(),
+            label
+                .map(|s| format!(" · {}", terminal(s)))
+                .unwrap_or_default(),
+            if i.kind == academic::Kind::Exam {
+                format!(" · {} 分钟", i.duration_minutes)
+            } else {
+                String::new()
+            },
+            i.score
+                .as_deref()
+                .map(|s| format!(" · 成绩 {}", terminal(s)))
+                .unwrap_or_default()
+        );
+        if countdown {
+            let minutes = (i.start.to_utc() - now).num_minutes().max(0);
+            println!("    距开始约 {} 小时 {} 分钟", minutes / 60, minutes % 60);
+        }
+        if let Some(note) = &i.note {
+            println!("    {}", terminal(note));
+        }
+    }
+}
+
+fn agenda_view(file: Option<&Path>, demo: bool, kind: &Command, json: bool) -> Result<u8> {
+    let now = Utc::now().with_timezone(&service::shanghai());
+    let demo_day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+    let anchor = if demo && file.is_none() {
+        demo_day
+    } else {
+        now.date_naive()
+    };
+    let mut grid = false;
+    let mut start_day = None;
+    let filter = match kind {
+        Command::Today { date, .. } => {
+            let d = date
+                .as_deref()
+                .map(academic::parse_date)
+                .transpose()?
+                .unwrap_or(anchor);
+            academic::Filter {
+                from: Some(d),
+                to: Some(d),
+                ..Default::default()
+            }
+        }
+        Command::Next { .. } => academic::Filter {
+            from: Some(anchor),
+            to: anchor.checked_add_days(Days::new(14)),
+            ..Default::default()
+        },
+        Command::Week { week, grid: g, .. } => {
+            grid = *g;
+            if let Some(week) = week {
+                academic::Filter {
+                    week: Some(*week),
+                    ..Default::default()
+                }
+            } else {
+                let (a, b) = academic::week_bounds(anchor, 1)?;
+                start_day = Some(a);
+                academic::Filter {
+                    from: Some(a),
+                    to: Some(b),
+                    ..Default::default()
+                }
+            }
+        }
+        _ => unreachable!(),
+    };
+    let mut data = academic::load(file, demo, academic::Kind::Class, &filter)?;
+    if matches!(kind, Command::Next { .. }) {
+        let cutoff = now + chrono::Duration::days(14);
+        data.items
+            .retain(|i| (demo && file.is_none()) || (i.start > now && i.start <= cutoff));
+        data.items.truncate(1);
+    }
+    if json {
+        dump(&data)?;
+    } else if grid {
+        let start = match (start_day, data.semester_start, filter.week) {
+            (Some(d), _, _) => d,
+            (_, Some(d), Some(w)) => academic::week_bounds(d, w)?.0,
+            _ => anchor,
+        };
+        print_grid(&data, start, anchor);
+    } else {
+        print_agenda(
+            &data,
+            matches!(kind, Command::Today { .. }),
+            matches!(kind, Command::Next { .. }) && !demo,
+        );
+    }
+    Ok(0)
+}
+
+fn print_grid(data: &academic::Agenda, start: NaiveDate, today: NaiveDate) {
+    let days: Vec<_> = (0..7)
+        .filter_map(|n| start.checked_add_days(Days::new(n)))
+        .collect();
+    println!("数据来源：{}（北京时间；* 今天）", terminal(&data.source));
+    let columns: Vec<Vec<_>> = days
+        .iter()
+        .map(|d| {
+            data.items
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.start.date_naive() == *d)
+                .collect()
+        })
+        .collect();
+    for d in &days {
+        print!(
+            "| {:^14} ",
+            format!(
+                "{}{}",
+                d.format("%m-%d"),
+                if *d == today { "*" } else { "" }
+            )
+        );
+    }
+    println!("|");
+    for n in 0..columns.iter().map(Vec::len).max().unwrap_or(0) {
+        for c in &columns {
+            let x = c
+                .get(n)
+                .map(|(i, e)| format!("{} #{:02}", e.start.format("%H:%M"), i + 1))
+                .unwrap_or_default();
+            print!("| {:^14} ", x);
+        }
+        println!("|");
+    }
+    for (i, e) in data.items.iter().enumerate() {
+        println!(
+            "  #{:02} {}–{} · {}{}",
+            i + 1,
+            e.start.format("%m-%d %H:%M"),
+            e.end.format("%H:%M"),
+            terminal(&e.title),
+            e.location
+                .as_deref()
+                .map(|l| format!(" · {}", terminal(l)))
+                .unwrap_or_default()
+        );
+    }
+    if data.items.is_empty() {
+        println!("没有匹配的教务安排。");
+    }
 }
 
 fn terminal(s: &str) -> String {
@@ -143,6 +481,111 @@ fn issue_list(errors: &[Issue]) {
     }
 }
 
+fn print_progress(data: &student::Progress, tree: bool, json: bool) -> Result<u8> {
+    if json {
+        dump(data)?;
+    } else {
+        let summary = |c: &student::Counts| {
+            format!(
+                "已完成 {} / 未完成 {} / 进行中 {} / 未知 {}",
+                c.complete, c.pending, c.in_progress, c.unknown
+            )
+        };
+        println!("{} · {}", terminal(&data.course), summary(&data.counts));
+        if tree {
+            for (chapter, counts) in &data.chapters {
+                println!("  {} · {}", terminal(chapter), summary(counts));
+                for i in data.items.iter().filter(|x| x.chapter == *chapter) {
+                    println!(
+                        "    {} · {} · {}",
+                        terminal(&i.title),
+                        i.kind,
+                        i.state.label()
+                    );
+                }
+            }
+        } else {
+            for i in &data.items {
+                println!(
+                    "  {} / {} · {} · {}",
+                    terminal(&i.chapter),
+                    terminal(&i.title),
+                    i.kind,
+                    i.state.label()
+                );
+            }
+        }
+        if data.limited {
+            println!("达到目录扫描限制，或有更深目录；结果不完整。");
+        }
+    }
+    Ok(0)
+}
+
+async fn status(probe: bool, demo: bool, json: bool) -> Result<u8> {
+    let mut data = if demo {
+        serde_json::json!({"mode":"demo","environment_token":false,"cached_session":false,"password_configured":false})
+    } else {
+        let environment_token =
+            std::env::var("KETANGPAI_TOKEN").is_ok_and(|s| !s.trim().is_empty());
+        let cached_session = client::cached_token();
+        let password = auth::resolve(auth::CredentialsInput::default());
+        serde_json::json!({ "mode":"live", "environment_token":environment_token,
+            "cached_session":cached_session.as_ref().is_ok_and(Option::is_some),
+            "cache_error":cached_session.err().map(|e| e.to_string()),
+            "password_configured":password.as_ref().is_ok_and(Option::is_some),
+            "config_error":password.err().map(|e| e.to_string()) })
+    };
+    let mut exit = 0;
+    if probe {
+        let checked = async {
+            Service(if demo {
+                Client::Demo
+            } else {
+                Client::configured().await?
+            })
+            .profile()
+            .await
+        }
+        .await;
+        match checked {
+            Ok(_) => data["probe"] = serde_json::json!({"ok":true,"network":!demo}),
+            Err(e) => {
+                data["probe"] =
+                    serde_json::json!({"ok":false,"network":!demo,"error":e.to_string()});
+                exit = 1;
+            }
+        }
+    }
+    if json {
+        dump(&data)?;
+    } else {
+        for (key, label) in [
+            ("environment_token", "环境变量 Token"),
+            ("cached_session", "本机会话"),
+            ("password_configured", "账号密码配置"),
+        ] {
+            println!("{label}：{}", if data[key] == true { "有" } else { "无" });
+        }
+        for key in ["cache_error", "config_error"] {
+            if let Some(e) = data[key].as_str() {
+                eprintln!("{}", terminal(e));
+            }
+        }
+        if probe {
+            println!(
+                "会话探测：{}",
+                if exit == 0 {
+                    "通过".into()
+                } else {
+                    terminal(data["probe"]["error"].as_str().unwrap_or("失败"))
+                }
+            );
+        }
+    }
+    Ok(exit)
+}
+
 fn row(item: &Item, index: usize, show_course: bool) {
     let mut meta = Vec::new();
     if show_course {
@@ -168,6 +611,12 @@ fn row(item: &Item, index: usize, show_course: bool) {
     }
     if let Some(max) = &item.max_grade {
         meta.push(format!("满分 {}", terminal(max)));
+    }
+    if let Some(seconds) = item.duration_seconds {
+        meta.push(format!("限时 {} 分 {} 秒", seconds / 60, seconds % 60));
+    }
+    if let Some(n) = item.question_count {
+        meta.push(format!("题量 {n}"));
     }
     let extra = if meta.is_empty() {
         String::new()
@@ -263,35 +712,110 @@ async fn run(cli: Cli) -> Result<u8> {
     if cli.demo && !cli.json {
         eprintln!("离线演示 · 以下均为示例数据");
     }
+    match &cli.command {
+        Command::Schedule(args) => {
+            return academic_command(academic::Kind::Class, args, cli.demo, cli.json);
+        }
+        Command::SchoolExams(args) => {
+            return academic_command(academic::Kind::Exam, args, cli.demo, cli.json);
+        }
+        Command::ScheduleIcs(args) => {
+            if args.output.is_none() {
+                return Err(err("请用 -o 指定课表日历输出文件。"));
+            }
+            return academic_command(academic::Kind::Class, args, cli.demo, cli.json);
+        }
+        Command::Today { file, .. } | Command::Next { file } | Command::Week { file, .. } => {
+            return agenda_view(file.as_deref(), cli.demo, &cli.command, cli.json);
+        }
+        Command::Status { probe } => return status(*probe, cli.demo, cli.json).await,
+        Command::Pan { folder, root } => {
+            let data = pan::list(root.as_deref(), folder.as_deref(), cli.demo)?;
+            if cli.json {
+                dump(&data)?;
+            } else {
+                println!(
+                    "{} · {}",
+                    if cli.demo {
+                        "云盘演示"
+                    } else {
+                        "本地云盘同步目录"
+                    },
+                    if data.folder.is_empty() {
+                        "根目录".into()
+                    } else {
+                        terminal(&data.folder)
+                    }
+                );
+                if data.items.is_empty() {
+                    println!("没有文件或子目录。");
+                }
+                for i in &data.items {
+                    println!(
+                        "  {} · {} [{}]{}",
+                        if i.is_folder { "目录" } else { "文件" },
+                        terminal(&i.name),
+                        terminal(&i.id),
+                        i.bytes.map(|n| format!(" · {n} B")).unwrap_or_default()
+                    );
+                }
+                if data.limited {
+                    println!("仅展示前 1000 个目录条目。");
+                }
+            }
+            return Ok(0);
+        }
+        _ => {}
+    }
     let scope = Scope {
         semester: cli.semester,
         term: cli.term,
     };
-    if let Command::Login { save } = cli.command {
+    if let Command::Login {
+        token,
+        no_save,
+        legacy_save: _,
+    } = cli.command
+    {
         if cli.demo {
             return Err(err("演示模式不需要登录。"));
         }
-        if !std::io::stdin().is_terminal() {
-            return Err(err(
-                "请在交互式终端运行 ktp login，非交互使用 KETANGPAI_TOKEN。",
-            ));
-        }
-        let token = rpassword::prompt_password("粘贴本人课堂派网页 Token（输入不可见）：")
-            .map_err(|_| err("读取 Token 失败。"))?;
-        let token = token.trim();
-        let profile = Service(Client::live(token)?).profile().await?;
-        if save {
-            save_token(token)?;
-        }
+        let save = !no_save;
+        let (profile, method) = if token {
+            if !std::io::stdin().is_terminal() {
+                return Err(err(
+                    "请在交互式终端手动导入 Token；非交互可设置 KETANGPAI_TOKEN。",
+                ));
+            }
+            let token = zeroize::Zeroizing::new(
+                rpassword::prompt_password("粘贴本人课堂派网页 Token（输入不可见）：")
+                    .map_err(|_| err("读取 Token 失败。"))?,
+            );
+            let (_, profile) = verify_token(token.trim()).await?;
+            if save {
+                save_token(token.trim())?;
+            }
+            (profile, "token")
+        } else {
+            let credentials = match auth::resolve(auth::CredentialsInput::default())? {
+                Some(credentials) => credentials,
+                None if std::io::stdin().is_terminal() => auth::Credentials::prompt()?,
+                None => return Err(auth::missing_credentials()),
+            };
+            let (_, profile) = auth::login(credentials, save).await?;
+            (profile, "password")
+        };
         if cli.json {
-            dump(&serde_json::json!({"verified":true, "saved":save, "profile":profile}))?;
+            dump(
+                &serde_json::json!({"verified":true,"method":method,"saved":save,"profile":profile}),
+            )?;
         } else {
             println!(
                 "{}",
                 if save {
-                    "验证通过，Token 已保存在本机。"
+                    "登录成功，会话已保存在本机。"
                 } else {
-                    "验证通过，未保存 Token。"
+                    "登录验证通过，未保存会话。"
                 }
             );
         }
@@ -300,7 +824,7 @@ async fn run(cli: Cli) -> Result<u8> {
     let mut api = Service(if cli.demo {
         Client::Demo
     } else {
-        Client::live(&read_token()?)?
+        Client::configured().await?
     });
     match cli.command {
         Command::Whoami => {
@@ -326,7 +850,33 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
             }
         }
-        Command::Courses => {
+        Command::Courses { all } => {
+            if all {
+                let data = api.all_courses().await?;
+                if cli.json {
+                    dump(&data)?;
+                } else {
+                    for entry in &data.items {
+                        println!(
+                            "  {}/{} · {} [{}]",
+                            terminal(&entry.semester.semester),
+                            terminal(&entry.semester.term),
+                            terminal(&entry.course.title),
+                            terminal(&entry.course.id)
+                        );
+                    }
+                    if data.items.is_empty() {
+                        println!("没有读到课程。");
+                    }
+                    if data.limited {
+                        println!("已达学期扫描上限。");
+                    }
+                    for e in &data.errors {
+                        eprintln!("{}", terminal(e));
+                    }
+                }
+                return Ok(if data.errors.is_empty() { 0 } else { 3 });
+            }
             let data = api.courses(&scope).await?;
             if cli.json {
                 dump(&data)?;
@@ -409,7 +959,35 @@ async fn run(cli: Cli) -> Result<u8> {
             course,
             directory,
             keyword,
+            find,
+            depth,
         } => {
+            if let Some(keyword) = find {
+                let matches =
+                    student::find_materials(&mut api, &scope, &course, &directory, depth, &keyword)
+                        .await?;
+                if cli.json {
+                    dump(&matches)?;
+                } else {
+                    println!("匹配资料（{} 项）", matches.items.len());
+                    for (idx, m) in matches.items.iter().enumerate() {
+                        row(&m.material, idx + 1, false);
+                        println!(
+                            "      {} · {}",
+                            if m.chapter.is_empty() {
+                                "当前目录".into()
+                            } else {
+                                terminal(&m.chapter.join(" / "))
+                            },
+                            m.material.url
+                        );
+                    }
+                    if matches.limited {
+                        println!("达到扫描限制，搜索结果可能不完整。");
+                    }
+                }
+                return Ok(0);
+            }
             return list(
                 "课程资料",
                 &api.list(
@@ -424,7 +1002,18 @@ async fn run(cli: Cli) -> Result<u8> {
                 false,
             );
         }
-        Command::Chapters { course, directory } => {
+        Command::Chapters {
+            course,
+            directory,
+            tree,
+            todo,
+            depth,
+        } => {
+            if tree || todo {
+                let data =
+                    student::progress(&mut api, &scope, &course, &directory, depth, todo).await?;
+                return print_progress(&data, true, cli.json);
+            }
             return list(
                 "章节内容",
                 &api.list(&scope, Kind::Chapter, Some(&course), None, &directory)
@@ -457,7 +1046,29 @@ async fn run(cli: Cli) -> Result<u8> {
                 );
             }
         }
-        Command::Watch { course, interval } => {
+        Command::Watch {
+            course,
+            interval,
+            once,
+            all_events,
+        } => {
+            if once && !all_events {
+                return board(
+                    &api.deadlines(&scope, course.as_deref(), Some(7)).await?,
+                    cli.json,
+                );
+            }
+            if all_events {
+                return watch_events(
+                    &mut api,
+                    &scope,
+                    course.as_deref(),
+                    interval,
+                    once,
+                    cli.json,
+                )
+                .await;
+            }
             if cli.json {
                 return Err(err("watch 不支持 --json，请用 hw --json。"));
             }
@@ -478,15 +1089,319 @@ async fn run(cli: Cli) -> Result<u8> {
                             last = current;
                         }
                     }
-                    Err(e @ Error::Auth(_)) => return Err(e),
+                    Err(e) if e.is_auth() => return Err(e),
                     Err(e) => eprintln!("本轮查询失败：{e}"),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(u64::from(interval) * 60)).await;
             }
         }
-        Command::Mcp | Command::Login { .. } => unreachable!(),
+        Command::Notifications {
+            unread,
+            keyword,
+            limit,
+            full,
+        } => {
+            let data =
+                student::notifications(&mut api, unread, keyword.as_deref(), limit, full).await?;
+            if cli.json {
+                dump(&data)?;
+            } else {
+                println!("课堂派通知中心（{} 条）", data.items.len());
+                for n in &data.items {
+                    println!(
+                        "  {} · {} · {} · {}{}",
+                        date(n.published_at),
+                        match n.unread {
+                            Some(true) => "未读",
+                            Some(false) => "已读",
+                            None => "状态未知",
+                        },
+                        n.category,
+                        terminal(&n.title),
+                        n.course
+                            .as_deref()
+                            .map(|c| format!(" · {}", terminal(c)))
+                            .unwrap_or_default()
+                    );
+                    if let Some(body) = &n.content {
+                        println!("    {}", terminal(body));
+                    }
+                }
+                if data.has_more {
+                    println!("  当前输出不是完整通知列表。");
+                }
+                if data.body_incomplete {
+                    println!("  部分学校通知正文未查到。");
+                }
+                println!("  网页：{}", data.url);
+            }
+        }
+        Command::Progress {
+            course,
+            directory,
+            depth,
+            todo,
+            max_courses,
+        } => {
+            if let Some(course) = course {
+                let data =
+                    student::progress(&mut api, &scope, &course, &directory, depth, todo).await?;
+                return print_progress(&data, false, cli.json);
+            }
+            if directory != "0" {
+                return Err(err("使用 --directory 需要指定课程。"));
+            }
+            let mut data = student::progress_overview(&mut api, &scope, depth, max_courses).await?;
+            if todo {
+                data.items
+                    .retain(|p| p.counts.pending + p.counts.in_progress + p.counts.unknown > 0);
+            }
+            if cli.json {
+                dump(&data)?;
+            } else {
+                println!("课程学习进度（{} 门课）", data.items.len());
+                for p in &data.items {
+                    println!(
+                        "  {} · 已完成 {} / 未完成 {} / 进行中 {} / 未知 {}{}",
+                        terminal(&p.course),
+                        p.counts.complete,
+                        p.counts.pending,
+                        p.counts.in_progress,
+                        p.counts.unknown,
+                        if p.limited {
+                            " · 部分目录未扫描"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if data.limited {
+                    println!("达到课程扫描上限；还有课程未查询。");
+                }
+                issue_list(&data.errors);
+            }
+            return Ok(if data.errors.is_empty() { 0 } else { 3 });
+        }
+        Command::Download {
+            course,
+            directory,
+            depth,
+            keyword,
+            material,
+            max_files,
+            dir,
+            dry_run,
+        } => {
+            let report = download::batch(
+                &mut api,
+                &scope,
+                download::Options {
+                    course: &course,
+                    directory: &directory,
+                    depth,
+                    keyword: keyword.as_deref(),
+                    material: material.as_deref(),
+                    max_files,
+                    output: &dir,
+                    dry_run,
+                },
+            )
+            .await?;
+            if cli.json {
+                dump(&report)?;
+            } else {
+                if report.items.is_empty() {
+                    println!("没有匹配的附件。");
+                }
+                for i in &report.items {
+                    println!(
+                        "  {} · {}{}",
+                        i.status,
+                        terminal(i.name.as_deref().unwrap_or(&i.material)),
+                        i.reason
+                            .as_deref()
+                            .map(|r| format!(" · {}", terminal(r)))
+                            .unwrap_or_default()
+                    );
+                }
+                if report.limited {
+                    println!("  达到扫描或下载数量限制；结果可能不完整。");
+                }
+            }
+            return Ok(if report.items.iter().any(|i| i.status == "failed") {
+                3
+            } else {
+                0
+            });
+        }
+        Command::Mcp
+        | Command::Login { .. }
+        | Command::Schedule(_)
+        | Command::SchoolExams(_)
+        | Command::ScheduleIcs(_)
+        | Command::Today { .. }
+        | Command::Next { .. }
+        | Command::Week { .. }
+        | Command::Pan { .. }
+        | Command::Status { .. } => {
+            unreachable!()
+        }
     }
     Ok(0)
+}
+
+async fn watch_events(
+    api: &mut Service,
+    scope: &Scope,
+    course: Option<&str>,
+    interval: u16,
+    once: bool,
+    json: bool,
+) -> Result<u8> {
+    use std::collections::BTreeMap;
+    if json && !once {
+        return Err(err("watch 的 JSON 输出需要 --once。"));
+    }
+    let mut previous = BTreeMap::<String, String>::new();
+    let mut previous_deadlines = String::new();
+    let mut initialized = false;
+    loop {
+        let deadlines = api.deadlines(scope, course, Some(7)).await;
+        let mut events = BTreeMap::<String, String>::new();
+        let mut errors: Vec<String> = vec![];
+        for (kind, label) in [
+            (Kind::Homework, "作业"),
+            (Kind::Material, "资料"),
+            (Kind::Test, "测验"),
+        ] {
+            let result = if kind == Kind::Material && course.is_none() {
+                // The general material command requires a single course; watch scans each
+                // course's top level only and records individual failures.
+                let courses = api.courses(scope).await?;
+                let mut listing = Listing {
+                    semester: courses.semester,
+                    items: vec![],
+                    errors: vec![],
+                };
+                for c in courses.items {
+                    match api.content(&c, Kind::Material, "0").await.and_then(|rs| {
+                        rs.iter()
+                            .filter(|r| !service::folder(r))
+                            .map(|r| service::normalize(r, Kind::Material, &c))
+                            .collect::<Result<Vec<Item>>>()
+                    }) {
+                        Ok(items) => listing.items.extend(items),
+                        Err(e) if e.is_auth() => return Err(e),
+                        Err(e) => listing.errors.push(Issue {
+                            course_id: c.id,
+                            course_title: c.title,
+                            error: e.to_string(),
+                        }),
+                    }
+                }
+                Ok(listing)
+            } else {
+                api.list(scope, kind, course, None, "0").await
+            };
+            match result {
+                Ok(listing) => {
+                    for i in listing.items.into_iter().filter(|i| !i.is_folder) {
+                        let key = format!("{label}:{}:{}", i.course_id, i.id);
+                        let line = format!(
+                            "{label} · {} · {}{}{}{}",
+                            i.course_title,
+                            i.title,
+                            i.status.map(|s| format!(" · {s}")).unwrap_or_default(),
+                            i.due_at
+                                .map(|d| format!(" · 截止 {}", date(Some(d))))
+                                .unwrap_or_default(),
+                            i.grade.map(|g| format!(" · 得分 {g}")).unwrap_or_default()
+                        );
+                        events.insert(key, line);
+                    }
+                    for i in listing.errors {
+                        errors.push(format!("{label} · {}：{}", i.course_title, i.error));
+                    }
+                }
+                Err(e) if e.is_auth() => return Err(e),
+                Err(e) => errors.push(format!("{label}：{e}")),
+            }
+        }
+        match student::notifications(api, false, None, 20, false).await {
+            Ok(inbox) => {
+                for i in inbox.items {
+                    events.insert(
+                        format!("通知:{}", i.id),
+                        format!("通知 · {} · {}", i.category, i.title),
+                    );
+                }
+            }
+            Err(e) if e.is_auth() => return Err(e),
+            Err(e) => errors.push(format!("通知：{e}")),
+        }
+        let deadlines = match deadlines {
+            Ok(board) => {
+                for i in &board.errors {
+                    errors.push(format!("截止看板 · {}：{}", i.course_title, i.error));
+                }
+                Some(board)
+            }
+            Err(e) if e.is_auth() => return Err(e),
+            Err(e) => {
+                errors.push(format!("截止看板：{e}"));
+                None
+            }
+        };
+        if once {
+            if json {
+                dump(
+                    &serde_json::json!({"events":events.values().collect::<Vec<_>>(),"deadlines":deadlines,"errors":errors}),
+                )?;
+            } else {
+                for line in events.values() {
+                    println!("{}", terminal(line));
+                }
+                if let Some(data) = deadlines {
+                    board(&data, false)?;
+                }
+                for error in &errors {
+                    eprintln!("{}", terminal(error));
+                }
+            }
+            return Ok(if errors.is_empty() { 0 } else { 3 });
+        }
+        if !initialized {
+            println!(
+                "动态巡检基线：{} 条。后续报告新增或变化；Ctrl+C 退出。",
+                events.len()
+            );
+            initialized = true;
+        } else {
+            for (key, line) in &events {
+                if previous.get(key) != Some(line) {
+                    println!("更新 · {}", terminal(line));
+                }
+            }
+        }
+        if let Some(current) = &deadlines {
+            let snapshot =
+                serde_json::to_string(current).map_err(|_| err("截止结果序列化失败。"))?;
+            if snapshot != previous_deadlines {
+                board(current, false)?;
+                previous_deadlines = snapshot;
+            }
+        }
+        // Preserve old items when an endpoint fails so recovery does not create false alerts.
+        if errors.is_empty() {
+            previous = events;
+        } else {
+            previous.extend(events);
+        }
+        for error in &errors {
+            eprintln!("{}", terminal(error));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(u64::from(interval) * 60)).await;
+    }
 }
 
 #[tokio::main]

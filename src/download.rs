@@ -87,7 +87,7 @@ fn attachment_url(raw: &str) -> Option<Url> {
     Some(url)
 }
 
-pub(crate) fn filename(raw: &str) -> String {
+fn filename(raw: &str) -> String {
     let leaf = raw.rsplit(['/', '\\']).next().unwrap_or_default();
     let clean: String = leaf.chars().map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { '_' } else { c }).collect();
     let clean = clean.trim_matches([' ', '.']);

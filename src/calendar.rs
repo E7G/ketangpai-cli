@@ -2,7 +2,7 @@ use crate::service::Item;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-pub(crate) fn escape(text: &str) -> String {
+fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace(';', "\\;")
         .replace(',', "\\,")
@@ -14,7 +14,7 @@ pub(crate) fn escape(text: &str) -> String {
         .collect()
 }
 
-pub(crate) fn fold(line: &str, out: &mut String) {
+fn fold(line: &str, out: &mut String) {
     let mut width = 0;
     for c in line.chars() {
         if width + c.len_utf8() > 75 {

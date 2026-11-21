@@ -92,37 +92,6 @@ struct ProgressArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AcademicArgs {
-    /// 起始日期（YYYY-MM-DD），含当日。
-    from: Option<String>,
-    /// 结束日期（YYYY-MM-DD），含当日。
-    to: Option<String>,
-    keyword: Option<String>,
-    /// 教学周次，与日期范围互斥；需在教务文件设置 semester_start。
-    week: Option<u16>,
-}
-
-impl AcademicArgs {
-    fn filter(self) -> QueryResult<crate::academic::Filter> {
-        Ok(crate::academic::Filter {
-            from: self
-                .from
-                .as_deref()
-                .map(crate::academic::parse_date)
-                .transpose()?,
-            to: self
-                .to
-                .as_deref()
-                .map(crate::academic::parse_date)
-                .transpose()?,
-            keyword: self.keyword,
-            week: self.week,
-        })
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 struct FindArgs {
     semester: Option<String>,
     term: Option<String>,
@@ -143,12 +112,6 @@ struct OverviewArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PanArgs {
-    folder_id: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 struct DownloadArgs {
     semester: Option<String>,
     term: Option<String>,
@@ -156,14 +119,6 @@ struct DownloadArgs {
     /// 资料 ID，请先用 list_materials 或 find_materials 查询。
     data_id: String,
     directory: Option<String>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ExportArgs {
-    /// 已配置输出目录内的文件名，不得含路径；默认 schedule.ics。
-    filename: Option<String>,
-    week: Option<u16>,
 }
 
 fn output_root() -> QueryResult<std::path::PathBuf> {
@@ -174,14 +129,6 @@ fn output_root() -> QueryResult<std::path::PathBuf> {
         return Err(err("MCP 输出路径必须是已存在的目录。"));
     }
     Ok(path)
-}
-
-fn calendar_name(name: Option<&str>) -> QueryResult<&str> {
-    let name = name.unwrap_or("schedule.ics");
-    if !name.to_ascii_lowercase().ends_with(".ics") || crate::download::filename(name) != name {
-        return Err(err("请使用不带路径的 .ics 文件名。"));
-    }
-    Ok(name)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -238,15 +185,6 @@ impl Server {
             Err(e) => reply::<()>(Err(e)),
         }
     }
-
-    fn academic(&self, kind: crate::academic::Kind, a: AcademicArgs) -> CallToolResult {
-        let result = (|| {
-            let f = a.filter()?;
-            // Do not accept arbitrary filesystem paths from tool callers.
-            crate::academic::load(None, self.demo, kind, &f)
-        })();
-        reply(result)
-    }
 }
 
 #[tool_router]
@@ -301,14 +239,6 @@ impl Server {
     }
 
     #[tool(
-        description = "列出本机预先配置的云盘同步目录；不是课堂派在线云盘，只返回文件和文件夹元数据。",
-        annotations(read_only_hint = true, open_world_hint = false)
-    )]
-    async fn list_pan_files(&self, Parameters(a): Parameters<PanArgs>) -> CallToolResult {
-        reply(crate::pan::list(None, a.folder_id.as_deref(), self.demo))
-    }
-
-    #[tool(
         description = "下载某个资料 ID 的已授权附件，仅写入预先配置的 MCP 输出目录，不覆盖文件。",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
@@ -346,34 +276,6 @@ impl Server {
             Ok(report)
         }
         .await;
-        reply(result)
-    }
-
-    #[tool(
-        description = "将本地教务课表导出到预先配置的 MCP 输出目录，不覆盖已有文件。",
-        annotations(read_only_hint = false, destructive_hint = false)
-    )]
-    async fn export_schedule_ics(&self, Parameters(a): Parameters<ExportArgs>) -> CallToolResult {
-        let result = (|| {
-            if self.demo {
-                return Err(err("演示模式不会通过 MCP 写文件。"));
-            }
-            let path = output_root()?.join(calendar_name(a.filename.as_deref())?);
-            let agenda = crate::academic::load(
-                None,
-                false,
-                crate::academic::Kind::Class,
-                &crate::academic::Filter {
-                    week: a.week,
-                    ..Default::default()
-                },
-            )?;
-            if agenda.items.is_empty() {
-                return Err(err("没有可导出的课程安排。"));
-            }
-            crate::export_file(&path, &crate::academic::export(&agenda))?;
-            Ok(serde_json::json!({"filename":path.file_name(),"count":agenda.items.len()}))
-        })();
         reply(result)
     }
 
@@ -452,22 +354,6 @@ impl Server {
             ),
             Err(e) => reply::<()>(Err(e)),
         }
-    }
-
-    #[tool(
-        description = "查询已导入本机的教务课表，不是课堂派实时课表。",
-        annotations(read_only_hint = true)
-    )]
-    async fn get_schedule(&self, Parameters(a): Parameters<AcademicArgs>) -> CallToolResult {
-        self.academic(crate::academic::Kind::Class, a)
-    }
-
-    #[tool(
-        description = "查询已导入本机的学校考试安排，不是课堂派课程测验，也不会连接学校系统。",
-        annotations(read_only_hint = true)
-    )]
-    async fn list_school_exams(&self, Parameters(a): Parameters<AcademicArgs>) -> CallToolResult {
-        self.academic(crate::academic::Kind::Exam, a)
     }
 
     #[tool(
@@ -654,23 +540,4 @@ pub async fn run(demo: bool) -> QueryResult<()> {
         .await
         .map_err(|_| err("MCP stdio 服务意外退出。"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn restricted_calendar_output_name() {
-        assert_eq!(calendar_name(Some("我的课表.ics")).unwrap(), "我的课表.ics");
-        for bad in [
-            "../file.ics",
-            "dir/file.ics",
-            "foo\\file.ics",
-            "C:file.ics",
-            "NUL.ics",
-            "schedule.txt",
-        ] {
-            assert!(calendar_name(Some(bad)).is_err(), "{bad}");
-        }
-    }
 }

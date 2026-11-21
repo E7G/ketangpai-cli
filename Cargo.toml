@@ -1,6 +1,6 @@
 [package]
 name = "ketangpai-cli"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 description = "Read-only Ketangpai student CLI and MCP server"
@@ -16,7 +16,6 @@ base64 = "0.22"
 cbc = "0.1.2"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
-csv = "1.3"
 html-escape = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
 rmcp = { version = "3.11", features = ["transport-io", "schemars"] }

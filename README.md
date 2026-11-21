@@ -68,11 +68,6 @@
 | `ktp materials 数字电路 --find 模板 --depth 3` | 递归搜索资料和附件名，显示所在目录 |
 | `ktp download 数字电路 --keyword 报告 --dry-run` | 预览课程里老师明确允许下载的文件 |
 | `ktp download 数字电路 --keyword 报告 --dir downloads` | 批量下载课程资料；已存在的同名文件不覆盖 |
-| `ktp schedule --file academic.json` | 查看从学校教务导入的个人课表 |
-| `ktp today` / `ktp next` / `ktp week 3 --grid` | 今天、下一节和第 3 教学周课表 |
-| `ktp schedule-ics -o 课表.ics` | 导出教务课表，含上课前 30 分钟提醒 |
-| `ktp school-exams --file academic.json` | 查看从学校教务导入的考试安排，与 `ktp exam` 区分 |
-| `ktp pan --root D:/MyCloud` | 列出本机同步的云盘目录；传返回的目录 ID 下钻 |
 | `ktp ics --days 14 -o 作业截止.ics` | 导出将到期的作业，含提前一小时的日历提醒；不覆盖文件 |
 | `ktp watch --interval 30` | 前台终端每 30 分钟查询一次，七天截止看板变化才输出；`Ctrl+C` 退出 |
 | `ktp watch --all-events --once --json` | 一次性输出截止、作业、测验、根目录资料和通知；去掉 `--once` 则报告轮询变化 |
@@ -86,24 +81,7 @@
 - `progress` 汇总课堂派网页返回的互动课件、资料、作业和课程测验状态，不把该汇总等同于学校的成绩或官方必修任务点统计。没有章节的课程会尝试从普通活动标签汇总。可指定 `--directory ID`、`--depth 0–8` 与 `--todo`；全课程模式可用 `--max-courses` 控制范围。
 - `download` 默认扫描两层子目录、最多尝试 20 个附件；可用 `--depth 0–8`、`--max-files 1–100` 或 `--material ID` 控制范围。单个附件上限 256 MiB。外链、未授权或不支持的下载地址会跳过，失败条目单列。`--demo download` 仅允许 `--dry-run`，不会写文件。
 
-### 教务课表与学校考试
-
-个人课表和学校考试**不直连学校教务系统**，需把教务导出或公布的安排整理成 `academic.example.json` 或 `academic.example.csv`（UTF-8）格式。`kind` 使用 `class` 或 `exam`，`start`、`end` 用 `YYYY-MM-DD HH:MM`（北京时间）或带偏移的 RFC 3339；`location`、`note` 可选。考试可以填写 `status` 与 `score`，未填写状态时仅按起止时间推算，不猜成绩。
-
-选填 `semester_start` 后可查看第 N 教学周（以其所在周的周一为第一周）。重复课程把起止时间写成第一周对应星期的日期，再填 `repeat_weeks`：JSON 例如 `[1,3,5]`，CSV 例如 `1-8|10|12-16`。不用重复或周次筛选时，可以直接写每次课的真实日期。
-
-```powershell
-.\ktp.exe --demo schedule
-.\ktp.exe week 1 --file academic.example.csv --grid
-.\ktp.exe schedule-ics --file academic.json -o 课表.ics
-.\ktp.exe school-exams --file academic.json -o 考试.ics
-```
-
-`schedule` 和 `school-exams` 都支持 `--from`、`--to`（含边界当日）、`--keyword`、`--json`、`-o` 日历导出。文件默认是当前目录的 `academic.json`，也可用 `KETANGPAI_ACADEMIC_FILE` 指定。不需要课堂派登录。不同学校的非标准导出需要先整理为模板，不会用课程测验替代统考。
-
-### 个人云盘替代方案与无 GUI 巡检
-
-课堂派学生端未查到可验证的个人云盘列表接口，教师备课区也不等同于学生个人文件。`pan` 仅读取通过 `--root` 或 `KETANGPAI_PAN_DIR` 配置的**本地同步目录**，返回名称、大小、更新时间和子目录 ID；不上传、不读取文件正文、不跟随目录内的符号链接或联接点。MCP 仅使用启动时配置的 `KETANGPAI_PAN_DIR`。
+### 终端巡检
 
 `watch --all-events` 在终端运行，不依赖 GUI。首轮建立基线，之后报告观察范围内的新增与状态变化；`--once --json` 可供本地调度器调用。课程资料巡检只扫根目录，不遍历整个资料库，也不会打开学习活动。
 
@@ -127,12 +105,11 @@
 | 能力 | MCP 工具 |
 |---|---|
 | 登录及课程 | `login`、`get_profile`、`list_semesters`、`list_courses` |
-| 教务课表及考试 | `get_schedule`、`export_schedule_ics`、`list_school_exams` |
 | 作业、测验及进度 | `list_homework`、`get_homework_detail`、`get_homework_deadlines`、`list_exams`（课程测验）、`list_chapters`、`get_chapter_progress`、`get_progress_overview` |
 | 通知 | `list_notifications`（通知中心）、`list_notices`（课程公告） |
-| 资料与文件 | `list_materials`、`find_materials`、`plan_material_download`、`download_material`、`list_pan_files`（本地同步目录） |
+| 资料与文件 | `list_materials`、`find_materials`、`plan_material_download`、`download_material` |
 
-教务查询建议给 MCP 进程设定 `KETANGPAI_ACADEMIC_FILE`。`download_material` 和 `export_schedule_ics` 默认不写文件，只有本机操作者预设了**已存在的** `KETANGPAI_MCP_OUTPUT_DIR` 才允许保存；工具调用者不能传任意目录，导出文件不得覆盖同名文件。
+`download_material` 默认不写文件，只有本机操作者预设了**已存在的** `KETANGPAI_MCP_OUTPUT_DIR` 才允许保存。工具调用者不能传任意目录，已有文件不会被覆盖。
 
 ## 从源码构建
 
@@ -152,4 +129,4 @@ cargo run --locked -- --demo hw --json
 - [men-shen/auto-homework-collector](https://github.com/men-shen/auto-homework-collector/blob/7c266cb7f242c1b9f89a81a417539e7aa21c26a7/crawler/crawler.py)：交叉核对课堂派课程与作业查询；请求形状与内容类型还参考了[课堂派公开网页前端](https://www.ketangpai.com/)。这些是网页使用的接口，不等同于有兼容性保证的开放 API。
 - MCP 使用 [官方 Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)。
 
-机构迁移版、个性化字段和网页接口变化可能需要适配。与学习通参考项目不同，课堂派版的教务课表与统考来自本地导入，云盘来自本地同步目录，没有把教师备课区当成学生云盘。项目不包含图形悬浮窗、系统托盘或 Qt 依赖。
+机构迁移版、个性化字段和网页接口变化可能需要适配。只接入课堂派学生端可查询的数据，不提供教务课表、全校统考或个人云盘的替代数据。项目不包含图形悬浮窗、系统托盘或 Qt 依赖。

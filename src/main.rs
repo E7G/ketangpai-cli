@@ -1,15 +1,13 @@
-mod academic;
 mod auth;
 mod calendar;
 mod client;
 mod demo;
 mod download;
-mod pan;
 mod server;
 mod service;
 mod student;
 
-use chrono::{DateTime, Days, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset};
 use clap::{Parser, Subcommand};
 use client::{Client, Result, err, save_token, verify_token};
 use serde::Serialize;
@@ -180,267 +178,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// 查看从本地教务数据导入的课表。
-    Schedule(AcademicArgs),
-    /// 查看今天的本地教务课表。
-    Today {
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long)]
-        date: Option<String>,
-    },
-    /// 查看未来 14 天的下一节课。
-    Next {
-        #[arg(long)]
-        file: Option<PathBuf>,
-    },
-    /// 查看当前自然周或指定教学周的本地教务课表。
-    Week {
-        week: Option<u16>,
-        #[arg(long)]
-        file: Option<PathBuf>,
-        #[arg(long)]
-        grid: bool,
-    },
-    /// 导出本地教务课表（默认全学期）。
-    ScheduleIcs(AcademicArgs),
-    /// 查看从本地教务数据导入的学校考试安排。
-    SchoolExams(AcademicArgs),
-    /// 列出指定本地云盘同步目录的文件（不连接课堂派云盘）。
-    Pan {
-        folder: Option<String>,
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
     /// 启动 MCP stdio 服务。
     Mcp,
-}
-
-#[derive(clap::Args)]
-struct AcademicArgs {
-    #[arg(long)]
-    file: Option<PathBuf>,
-    #[arg(long)]
-    from: Option<String>,
-    #[arg(long)]
-    to: Option<String>,
-    #[arg(short, long)]
-    keyword: Option<String>,
-    #[arg(long, conflicts_with_all = ["from", "to"])]
-    week: Option<u16>,
-    /// 将筛选后的安排导出为 iCalendar。
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-}
-
-fn academic_command(
-    kind: academic::Kind,
-    args: &AcademicArgs,
-    demo: bool,
-    json: bool,
-) -> Result<u8> {
-    let filter = academic::Filter {
-        from: args.from.as_deref().map(academic::parse_date).transpose()?,
-        to: args.to.as_deref().map(academic::parse_date).transpose()?,
-        keyword: args.keyword.clone(),
-        week: args.week,
-    };
-    let data = academic::load(args.file.as_deref(), demo, kind, &filter)?;
-    if let Some(path) = &args.output {
-        if data.items.is_empty() {
-            return Err(err("没有可以导出的教务安排。"));
-        }
-        export_file(path, &academic::export(&data))?;
-    }
-    if json {
-        dump(&data)?;
-    } else {
-        print_agenda(&data, false, false);
-        if let Some(path) = &args.output {
-            println!("日历已导出：{}", terminal(&path.to_string_lossy()));
-        }
-    }
-    Ok(0)
-}
-
-fn print_agenda(data: &academic::Agenda, show_today: bool, countdown: bool) {
-    let now = Utc::now();
-    println!(
-        "数据来源：{}（本地导入 · 北京时间）",
-        terminal(&data.source)
-    );
-    if data.items.is_empty() {
-        println!("没有匹配的教务安排。");
-    }
-    for i in &data.items {
-        let label = if show_today {
-            Some(if now < i.start {
-                "未开始"
-            } else if now >= i.end {
-                "已结束"
-            } else {
-                "进行中"
-            })
-        } else {
-            i.status.as_deref()
-        };
-        println!(
-            "  {} → {} · {}{}{}{}{}",
-            date(Some(i.start)),
-            date(Some(i.end)),
-            terminal(&i.title),
-            i.location
-                .as_deref()
-                .map(|loc| format!(" · {}", terminal(loc)))
-                .unwrap_or_default(),
-            label
-                .map(|s| format!(" · {}", terminal(s)))
-                .unwrap_or_default(),
-            if i.kind == academic::Kind::Exam {
-                format!(" · {} 分钟", i.duration_minutes)
-            } else {
-                String::new()
-            },
-            i.score
-                .as_deref()
-                .map(|s| format!(" · 成绩 {}", terminal(s)))
-                .unwrap_or_default()
-        );
-        if countdown {
-            let minutes = (i.start.to_utc() - now).num_minutes().max(0);
-            println!("    距开始约 {} 小时 {} 分钟", minutes / 60, minutes % 60);
-        }
-        if let Some(note) = &i.note {
-            println!("    {}", terminal(note));
-        }
-    }
-}
-
-fn agenda_view(file: Option<&Path>, demo: bool, kind: &Command, json: bool) -> Result<u8> {
-    let now = Utc::now().with_timezone(&service::shanghai());
-    let demo_day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
-    let anchor = if demo && file.is_none() {
-        demo_day
-    } else {
-        now.date_naive()
-    };
-    let mut grid = false;
-    let mut start_day = None;
-    let filter = match kind {
-        Command::Today { date, .. } => {
-            let d = date
-                .as_deref()
-                .map(academic::parse_date)
-                .transpose()?
-                .unwrap_or(anchor);
-            academic::Filter {
-                from: Some(d),
-                to: Some(d),
-                ..Default::default()
-            }
-        }
-        Command::Next { .. } => academic::Filter {
-            from: Some(anchor),
-            to: anchor.checked_add_days(Days::new(14)),
-            ..Default::default()
-        },
-        Command::Week { week, grid: g, .. } => {
-            grid = *g;
-            if let Some(week) = week {
-                academic::Filter {
-                    week: Some(*week),
-                    ..Default::default()
-                }
-            } else {
-                let (a, b) = academic::week_bounds(anchor, 1)?;
-                start_day = Some(a);
-                academic::Filter {
-                    from: Some(a),
-                    to: Some(b),
-                    ..Default::default()
-                }
-            }
-        }
-        _ => unreachable!(),
-    };
-    let mut data = academic::load(file, demo, academic::Kind::Class, &filter)?;
-    if matches!(kind, Command::Next { .. }) {
-        let cutoff = now + chrono::Duration::days(14);
-        data.items
-            .retain(|i| (demo && file.is_none()) || (i.start > now && i.start <= cutoff));
-        data.items.truncate(1);
-    }
-    if json {
-        dump(&data)?;
-    } else if grid {
-        let start = match (start_day, data.semester_start, filter.week) {
-            (Some(d), _, _) => d,
-            (_, Some(d), Some(w)) => academic::week_bounds(d, w)?.0,
-            _ => anchor,
-        };
-        print_grid(&data, start, anchor);
-    } else {
-        print_agenda(
-            &data,
-            matches!(kind, Command::Today { .. }),
-            matches!(kind, Command::Next { .. }) && !demo,
-        );
-    }
-    Ok(0)
-}
-
-fn print_grid(data: &academic::Agenda, start: NaiveDate, today: NaiveDate) {
-    let days: Vec<_> = (0..7)
-        .filter_map(|n| start.checked_add_days(Days::new(n)))
-        .collect();
-    println!("数据来源：{}（北京时间；* 今天）", terminal(&data.source));
-    let columns: Vec<Vec<_>> = days
-        .iter()
-        .map(|d| {
-            data.items
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.start.date_naive() == *d)
-                .collect()
-        })
-        .collect();
-    for d in &days {
-        print!(
-            "| {:^14} ",
-            format!(
-                "{}{}",
-                d.format("%m-%d"),
-                if *d == today { "*" } else { "" }
-            )
-        );
-    }
-    println!("|");
-    for n in 0..columns.iter().map(Vec::len).max().unwrap_or(0) {
-        for c in &columns {
-            let x = c
-                .get(n)
-                .map(|(i, e)| format!("{} #{:02}", e.start.format("%H:%M"), i + 1))
-                .unwrap_or_default();
-            print!("| {:^14} ", x);
-        }
-        println!("|");
-    }
-    for (i, e) in data.items.iter().enumerate() {
-        println!(
-            "  #{:02} {}–{} · {}{}",
-            i + 1,
-            e.start.format("%m-%d %H:%M"),
-            e.end.format("%H:%M"),
-            terminal(&e.title),
-            e.location
-                .as_deref()
-                .map(|l| format!(" · {}", terminal(l)))
-                .unwrap_or_default()
-        );
-    }
-    if data.items.is_empty() {
-        println!("没有匹配的教务安排。");
-    }
 }
 
 fn terminal(s: &str) -> String {
@@ -712,60 +451,8 @@ async fn run(cli: Cli) -> Result<u8> {
     if cli.demo && !cli.json {
         eprintln!("离线演示 · 以下均为示例数据");
     }
-    match &cli.command {
-        Command::Schedule(args) => {
-            return academic_command(academic::Kind::Class, args, cli.demo, cli.json);
-        }
-        Command::SchoolExams(args) => {
-            return academic_command(academic::Kind::Exam, args, cli.demo, cli.json);
-        }
-        Command::ScheduleIcs(args) => {
-            if args.output.is_none() {
-                return Err(err("请用 -o 指定课表日历输出文件。"));
-            }
-            return academic_command(academic::Kind::Class, args, cli.demo, cli.json);
-        }
-        Command::Today { file, .. } | Command::Next { file } | Command::Week { file, .. } => {
-            return agenda_view(file.as_deref(), cli.demo, &cli.command, cli.json);
-        }
-        Command::Status { probe } => return status(*probe, cli.demo, cli.json).await,
-        Command::Pan { folder, root } => {
-            let data = pan::list(root.as_deref(), folder.as_deref(), cli.demo)?;
-            if cli.json {
-                dump(&data)?;
-            } else {
-                println!(
-                    "{} · {}",
-                    if cli.demo {
-                        "云盘演示"
-                    } else {
-                        "本地云盘同步目录"
-                    },
-                    if data.folder.is_empty() {
-                        "根目录".into()
-                    } else {
-                        terminal(&data.folder)
-                    }
-                );
-                if data.items.is_empty() {
-                    println!("没有文件或子目录。");
-                }
-                for i in &data.items {
-                    println!(
-                        "  {} · {} [{}]{}",
-                        if i.is_folder { "目录" } else { "文件" },
-                        terminal(&i.name),
-                        terminal(&i.id),
-                        i.bytes.map(|n| format!(" · {n} B")).unwrap_or_default()
-                    );
-                }
-                if data.limited {
-                    println!("仅展示前 1000 个目录条目。");
-                }
-            }
-            return Ok(0);
-        }
-        _ => {}
+    if let Command::Status { probe } = &cli.command {
+        return status(*probe, cli.demo, cli.json).await;
     }
     let scope = Scope {
         semester: cli.semester,
@@ -1234,16 +921,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 0
             });
         }
-        Command::Mcp
-        | Command::Login { .. }
-        | Command::Schedule(_)
-        | Command::SchoolExams(_)
-        | Command::ScheduleIcs(_)
-        | Command::Today { .. }
-        | Command::Next { .. }
-        | Command::Week { .. }
-        | Command::Pan { .. }
-        | Command::Status { .. } => {
+        Command::Mcp | Command::Login { .. } | Command::Status { .. } => {
             unreachable!()
         }
     }
